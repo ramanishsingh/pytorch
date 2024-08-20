@@ -27,6 +27,7 @@ from ..source import (
     GetItemSource,
     ODictGetItemSource,
     RandomValueSource,
+    UnspecializedParamBufferSource,
     WeakRefCallSource,
 )
 from ..utils import (
@@ -74,6 +75,11 @@ def is_forbidden_context_manager(ctx):
         from _pytest.python_api import RaisesContext
         from _pytest.recwarn import WarningsChecker
 
+        # TODO mlazos: Temporary to get this stack to pass
+        # remove in subsequent PR
+        from torch.overrides import BaseTorchFunctionMode
+
+        f_ctxs.append(BaseTorchFunctionMode)
         f_ctxs.append(RaisesContext)
         f_ctxs.append(WarningsChecker)
     except ImportError:
@@ -1050,6 +1056,19 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                     )
                 else:
                     return trace_rules.lookup(func)(func)
+
+        if (
+            torch._dynamo.config.inline_inbuilt_nn_modules
+            and source
+            and isinstance(self, variables.UnspecializedNNModuleVariable)
+            # export has some awkwardness around specialized and unspecialized modules. Skip wrapping source for export
+            # usecase for now.
+            and not tx.output.export
+        ):
+            # Recalculate source for params/buffers
+            if name in ("_buffers", "_parameters"):
+                source = UnspecializedParamBufferSource(self.source, name)
+            source = self._wrap_source(source)
 
         if subobj is not NO_SUCH_SUBOBJ:
             if is_wrapper_or_member_descriptor(subobj):
