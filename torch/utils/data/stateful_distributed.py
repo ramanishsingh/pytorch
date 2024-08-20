@@ -6,22 +6,16 @@
 
 from typing import Any, Dict, Iterator, Optional, Sized
 
-import torch.utils.data.sampler
+import torch
 from . import Sampler, Dataset
-from torch.utils.data.dataloader import _InfiniteConstantSampler
-
 from .stateful import Stateful
-import torch.distributed as dist
+
 
 class _StatefulDistributedSamplerIterator(Iterator[int], Stateful):
-    #_GENERATOR = "generator"
-    
-    
+
     def __init__(self, sampler, parent_iterator: Iterator[int]):
         self.sampler = sampler
         self.parent_iterator = parent_iterator
-       
-        #self.generator_state = sampler.generator.get_state()
 
     def __next__(self) -> int:
         if self.sampler.next_yielded is not None:
@@ -36,11 +30,9 @@ class _StatefulDistributedSamplerIterator(Iterator[int], Stateful):
         return val
 
 
-
-
-
 class StatefulDistributedSampler(torch.utils.data.distributed.DistributedSampler):
     _YIELDED = "yielded"
+
     def __init__(
         self,
         dataset: Dataset,
@@ -49,11 +41,8 @@ class StatefulDistributedSampler(torch.utils.data.distributed.DistributedSampler
         shuffle: bool = True,
         seed: int = 0,
         drop_last: bool = False,
-        
-        
     ) -> None:
 
-       
         super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
         self.yielded = 0
         self.next_yielded = None
