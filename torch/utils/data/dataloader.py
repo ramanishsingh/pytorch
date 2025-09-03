@@ -22,9 +22,6 @@ from typing import Any, Generic, Optional, TYPE_CHECKING, TypeVar, Union
 import torch
 import torch.distributed as dist
 import torch.utils.data.graph_settings
-
-from _utils.stateful import Stateful
-from _utils.worker import get_worker_info, try_to_deserialize, try_to_serialize
 from torch._utils import ExceptionWrapper
 from torch.utils.data import _utils
 from torch.utils.data.datapipes.datapipe import (
@@ -41,6 +38,9 @@ from torch.utils.data.sampler import (
     SequentialSampler,
 )
 from typing_extensions import Self
+
+from ._utils.stateful import Stateful
+from ._utils.worker import get_worker_info, try_to_deserialize, try_to_serialize
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -547,8 +547,7 @@ class DataLoader(Generic[_T_co]):
         if (
             self.stateful
             and self._iterator is not None
-            and hasattr(self._iterator, "_finished")
-            and self._iterator._finished
+            and getattr(self._iterator, "_finished", False)
         ):
             if self.persistent_workers:
                 self._iterator._reset(self)
