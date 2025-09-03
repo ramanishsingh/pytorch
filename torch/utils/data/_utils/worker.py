@@ -9,16 +9,136 @@ import os
 import queue
 import random
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING, Union
+from typing import Any, Dict, Optional, TYPE_CHECKING, TypeVar, Union
 
 import torch
 from torch._utils import ExceptionWrapper
 
 from . import HAS_NUMPY, IS_WINDOWS, MP_STATUS_CHECK_INTERVAL, signal_handling
 
+from .stateful import Stateful
+
 
 if TYPE_CHECKING:
     from torch.utils.data import Dataset
+
+T = TypeVar("T")
+
+
+# Stateful functionality
+def try_to_serialize(obj: Any) -> Union[dict, None]:
+    """Try to serialize an object if it implements Stateful protocol."""
+    if isinstance(obj, Stateful):
+        return obj.state_dict()
+    return None
+
+
+def try_to_deserialize(obj: T, state_dict: dict) -> T:
+    """Try to deserialize an object if it implements Stateful protocol."""
+    if isinstance(obj, Stateful) and state_dict is not None:
+        obj.load_state_dict(state_dict)
+    return obj
+
+
+# Add alias for backward compatibility
+_try_to_deserialize = try_to_deserialize
+
+
+@dataclass(frozen=True)
+class _AckStartup:
+    """Dummy class used to ack startup and return state at time 0"""
+
+    worker_id: int
+    initial_state: Optional[Union[Dict[str, Any], ExceptionWrapper]]
+    is_delta: bool = False
+
+
+# State constants for stateful workers
+_DATASET_ITER_STATE = "_dataset_iter_state"
+_DATASET_STATE = "_dataset_state"
+_FETCHER_ENDED = "_fetcher_ended"
+_FETCHER_STATE = "_fetcher_state"
+_WORKER_ID = "_worker_id"
+
+
+class _IncrementalWorkerState:
+    """Manages incremental state changes for worker processes."""
+
+    def __init__(self, initial_worker_state_dict: Optional[Dict[str, Any]]):
+        self._worker_id = None
+        self._fetcher_ended = None
+
+        dataset_state = None
+        fetcher_iter_state = None
+        if initial_worker_state_dict:
+            self._worker_id = initial_worker_state_dict[_WORKER_ID]
+            dataset_state = initial_worker_state_dict.get(_DATASET_STATE, None)
+            fetcher_state = initial_worker_state_dict.get(_FETCHER_STATE, None)
+            if fetcher_state is not None:
+                self._fetcher_ended = fetcher_state[_FETCHER_ENDED]
+                fetcher_iter_state = fetcher_state.get(_DATASET_ITER_STATE, None)
+
+        # Use simple state management for now (can be enhanced later with proper delta compression)
+        self._dataset_state = dataset_state
+        self._fetcher_iter_state = fetcher_iter_state
+
+    def generate_delta(self, new_state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        assert _WORKER_ID in new_state_dict
+        self._worker_id = new_state_dict[_WORKER_ID]
+
+        # For now, we return the full delta state
+        # TODO: Implement proper delta compression like the reference
+        incr_state_dict = {_WORKER_ID: self._worker_id, _FETCHER_STATE: None}
+
+        ds_state = new_state_dict.get(_DATASET_STATE, None)
+        if ds_state is not None:
+            incr_state_dict[_DATASET_STATE] = ds_state
+            self._dataset_state = ds_state
+
+        fetcher_state = new_state_dict.get(_FETCHER_STATE, None)
+        if fetcher_state is not None:
+            self._fetcher_ended = fetcher_state[_FETCHER_ENDED]
+
+            iter_state = fetcher_state.get(_DATASET_ITER_STATE, None)
+            if iter_state is not None:
+                self._fetcher_iter_state = iter_state
+
+            incr_state_dict[_FETCHER_STATE] = {
+                _DATASET_ITER_STATE: iter_state,
+                _FETCHER_ENDED: self._fetcher_ended,
+            }
+        return incr_state_dict
+
+    def apply_delta(self, delta_state_dict: Dict[str, Any]) -> None:
+        """Apply a delta to the current state."""
+        self._worker_id = delta_state_dict[_WORKER_ID]
+        ds_state = delta_state_dict.get(_DATASET_STATE, None)
+        if ds_state is not None:
+            self._dataset_state = ds_state
+
+        fetcher_state = delta_state_dict.get(_FETCHER_STATE, None)
+        if fetcher_state is not None:
+            self._fetcher_ended = fetcher_state[_FETCHER_ENDED]
+            iter_state = fetcher_state.get(_DATASET_ITER_STATE, None)
+            if iter_state is not None:
+                self._fetcher_iter_state = iter_state
+
+    def get_state(self) -> Dict[str, Any]:
+        """Get the current state."""
+        fetcher_state = (
+            {
+                _FETCHER_ENDED: self._fetcher_ended,
+                _DATASET_ITER_STATE: self._fetcher_iter_state,
+            }
+            if self._fetcher_ended is not None
+            else None
+        )
+        return {
+            _WORKER_ID: self._worker_id,
+            _DATASET_STATE: self._dataset_state,
+            _FETCHER_STATE: fetcher_state,
+        }
+
 
 if IS_WINDOWS:
     import ctypes
@@ -241,6 +361,7 @@ def _worker_loop(
     persistent_workers,
     shared_seed,
 ):
+    """Original worker loop for non-stateful DataLoader."""
     # See NOTE [ Data Loader Multiprocessing Shutdown Logic ] for details on the
     # logic of this function.
 
@@ -372,3 +493,266 @@ def _worker_loop(
     if done_event.is_set():
         data_queue.cancel_join_thread()
         data_queue.close()
+
+
+def _stateful_worker_loop(
+    dataset_kind,
+    dataset,
+    index_queue,
+    data_queue,
+    done_event,
+    auto_collation,
+    collate_fn,
+    drop_last,
+    base_seed,
+    init_fn,
+    worker_id,
+    num_workers,
+    persistent_workers,
+    shared_seed,
+    worker_state,
+):
+    """Stateful worker loop that handles state management."""
+    # See NOTE [ Data Loader Multiprocessing Shutdown Logic ] for details on the
+    # logic of this function.
+
+    try:
+        # Initialize C side signal handlers for SIGBUS and SIGSEGV. Python signal
+        # module's handlers are executed after Python returns from C low-level
+        # handlers, likely when the same fatal signal had already happened
+        # again.
+        # https://docs.python.org/3/library/signal.html#execution-of-python-signal-handlers
+        signal_handling._set_worker_signal_handlers()
+
+        torch.multiprocessing._set_thread_name("pt_data_worker")
+
+        torch.set_num_threads(1)
+        seed = base_seed + worker_id
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if HAS_NUMPY:
+            np_seed = _generate_state(base_seed, worker_id)
+            import numpy as np
+
+            np.random.seed(np_seed)
+
+        from torch.utils.data import IterDataPipe
+        from torch.utils.data.graph_settings import apply_random_seed
+
+        shared_rng = torch.Generator()
+        if isinstance(dataset, IterDataPipe):
+            assert shared_seed is not None
+            shared_rng.manual_seed(shared_seed)
+            dataset = apply_random_seed(dataset, shared_rng)
+
+        global _worker_info
+        _worker_info = WorkerInfo(
+            id=worker_id, num_workers=num_workers, seed=seed, dataset=dataset
+        )
+
+        from torch.utils.data import _DatasetKind
+
+        # Stateful worker initialization
+        incremental_worker_state: _IncrementalWorkerState
+        init_exception = None
+        fetcher = None
+        initial_state = None
+        is_delta = False
+
+        try:
+            if init_fn is not None:
+                init_fn(worker_id)
+
+            if worker_state is None:
+                fetcher = _DatasetKind.create_fetcher(
+                    dataset_kind, dataset, auto_collation, collate_fn, drop_last
+                )
+                initial_state = _make_state_dict(
+                    worker_id, dataset_kind, fetcher, dataset
+                )
+                incremental_worker_state = _IncrementalWorkerState(initial_state)
+            else:
+                # Always restore in this order:
+                #  1. try to restore dataset state
+                #  2. generate dataset iterator
+                #  3. try to restore iterator state
+                incremental_worker_state = _IncrementalWorkerState(worker_state)
+                if worker_state[_DATASET_STATE] is not None:
+                    dataset = try_to_deserialize(dataset, worker_state[_DATASET_STATE])
+                fetcher = _DatasetKind.create_fetcher(
+                    dataset_kind, dataset, auto_collation, collate_fn, drop_last
+                )
+                if worker_state[_FETCHER_STATE] is not None:
+                    if dataset_kind == _DatasetKind.Iterable:
+                        if (
+                            worker_state[_FETCHER_STATE][_DATASET_ITER_STATE]
+                            is not None
+                        ):
+                            dataset_iter = try_to_deserialize(
+                                fetcher.dataset_iter,
+                                worker_state[_FETCHER_STATE][_DATASET_ITER_STATE],
+                            )
+                            if dataset_iter is not None:
+                                fetcher.dataset_iter = dataset_iter
+                        # We always force fetcher to request at least one batch even if
+                        # we know it will lead to immediate stop iteration
+                        fetcher.ended = False
+                iteration_end = False
+                initial_state = incremental_worker_state.generate_delta(
+                    _make_state_dict(worker_id, dataset_kind, fetcher, dataset)
+                )
+                is_delta = True
+
+                del worker_state
+        except Exception:
+            init_exception = ExceptionWrapper(
+                where=f"in DataLoader worker process {worker_id}"
+            )
+
+        # When using Iterable mode, some worker can exit earlier than others due
+        # to the IterableDataset behaving differently for different workers.
+        # When such things happen, an `_IterableDatasetStopIteration` object is
+        # sent over to the main process with the ID of this worker, so that the
+        # main process won't send more tasks to this worker, and will send
+        # `None` to this worker to properly exit it.
+        #
+        # Note that we cannot set `done_event` from a worker as it is shared
+        # among all processes. Instead, we set the `iteration_end` flag to
+        # signify that the iterator is exhausted. When either `done_event` or
+        # `iteration_end` is set, we skip all processing step and just wait for
+        # `None`.
+        iteration_end = False
+
+        watchdog = ManagerWatchdog()
+
+        while watchdog.is_alive():
+            try:
+                r = index_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
+            except queue.Empty:
+                continue
+            if isinstance(r, _AckStartup):
+                # Send ack and initial state to the main process
+                data_queue.put(
+                    (
+                        r,
+                        _AckStartup(
+                            worker_id=worker_id,
+                            initial_state=init_exception or initial_state,
+                            is_delta=is_delta,
+                        ),
+                    )
+                )
+                del initial_state
+                del is_delta
+                continue
+            elif isinstance(r, _ResumeIteration):
+                iteration_end = False
+
+                if isinstance(dataset, IterDataPipe):
+                    assert r.seed is not None
+                    shared_rng.manual_seed(r.seed)
+                    dataset = apply_random_seed(dataset, shared_rng)
+
+                try:
+                    # Recreate the fetcher for worker-reuse policy
+                    fetcher = _DatasetKind.create_fetcher(
+                        dataset_kind, dataset, auto_collation, collate_fn, drop_last
+                    )
+                    # see NOTE [ Incremental Worker State ]
+                    initial_state = _make_state_dict(
+                        worker_id, dataset_kind, fetcher, dataset
+                    )
+                    incremental_worker_state = _IncrementalWorkerState(initial_state)
+                except Exception:
+                    init_exception = ExceptionWrapper(
+                        where=f"in DataLoader worker process {worker_id}"
+                    )
+
+                # Acknowledge the main process
+                data_queue.put(
+                    (
+                        r,
+                        _AckStartup(
+                            worker_id=worker_id,
+                            initial_state=init_exception or initial_state,
+                        ),
+                    )
+                )
+                del initial_state
+                continue
+            elif r is None:
+                # Received the final signal
+                assert done_event.is_set() or iteration_end
+                break
+            elif done_event.is_set() or iteration_end:
+                # `done_event` is set. But I haven't received the final signal
+                # (None) yet. I will keep continuing until get it, and skip the
+                # processing steps.
+                continue
+            idx, (index, snapshot) = r
+            data: Union[_IterableDatasetStopIteration, ExceptionWrapper]
+            delta_state_dict = None
+            if init_exception is not None:
+                data = init_exception
+                init_exception = None
+            else:
+                try:
+                    try:
+                        data = fetcher.fetch(index)  # type: ignore[union-attr]
+                    except StopIteration:
+                        if not dataset_kind == _DatasetKind.Iterable:
+                            raise
+                        data = _IterableDatasetStopIteration(worker_id)
+                        # Set `iteration_end`
+                        #   (1) to save future `next(...)` calls, and
+                        #   (2) to avoid sending multiple `_IterableDatasetStopIteration`s.
+                        iteration_end = True
+                    if snapshot or iteration_end:
+                        # Generate incremental diff from prev_state_dict and current_state_dict
+                        state_dict = _make_state_dict(
+                            worker_id, dataset_kind, fetcher, dataset
+                        )
+                        delta_state_dict = incremental_worker_state.generate_delta(
+                            state_dict
+                        )
+                        del state_dict
+                except Exception:
+                    # It is important that we don't store exc_info in a variable.
+                    # `ExceptionWrapper` does the correct thing.
+                    # See NOTE [ Python Traceback Reference Cycle Problem ]
+                    data = ExceptionWrapper(
+                        where=f"in DataLoader worker process {worker_id}"
+                    )
+
+            data_queue.put((idx, (data, worker_id, delta_state_dict)))
+            del data, idx, index, r, delta_state_dict  # save memory
+    except KeyboardInterrupt:
+        # Main process will raise KeyboardInterrupt anyways.
+        pass
+    if done_event.is_set():
+        data_queue.cancel_join_thread()
+        data_queue.close()
+
+
+def _make_state_dict(worker_id, dataset_kind, fetcher, dataset) -> Dict[str, Any]:
+    """Create a state dictionary for the current worker state."""
+    from torch.utils.data import _DatasetKind
+
+    if dataset_kind == _DatasetKind.Iterable:
+        fetcher_state = {
+            _DATASET_ITER_STATE: try_to_serialize(fetcher.dataset_iter),
+            _FETCHER_ENDED: fetcher.ended,
+        }
+        dataset_state = None
+        if fetcher.dataset_iter is not fetcher.dataset:
+            dataset_state = try_to_serialize(fetcher.dataset)
+    else:
+        fetcher_state = None
+        # Pick up any user-defined dataset state
+        dataset_state = try_to_serialize(dataset)
+
+    return {
+        _WORKER_ID: worker_id,
+        _FETCHER_STATE: fetcher_state,
+        _DATASET_STATE: dataset_state,
+    }

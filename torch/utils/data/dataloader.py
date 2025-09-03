@@ -18,11 +18,13 @@ import threading
 import warnings
 from collections.abc import Callable
 from typing import Any, Generic, Optional, TYPE_CHECKING, TypeVar, Union
-from typing_extensions import Self
 
 import torch
 import torch.distributed as dist
 import torch.utils.data.graph_settings
+
+from _utils.stateful import Stateful
+from _utils.worker import get_worker_info, try_to_deserialize, try_to_serialize
 from torch._utils import ExceptionWrapper
 from torch.utils.data import _utils
 from torch.utils.data.datapipes.datapipe import (
@@ -38,7 +40,7 @@ from torch.utils.data.sampler import (
     Sampler,
     SequentialSampler,
 )
-
+from typing_extensions import Self
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -72,6 +74,21 @@ default_convert = _utils.collate.default_convert
 get_worker_info = _utils.worker.get_worker_info
 
 logger = logging.getLogger(__name__)
+
+# Constants for stateful functionality
+_INDEX_SAMPLER_STATE = "_index_sampler_state"
+_SAMPLER_ITER_STATE = "_sampler_iter_state"
+_SAMPLER_ITER_YIELDED = "_sampler_iter_yielded"
+_ITERABLEDATASET_LEN_CALLED = "_IterableDataset_len_called"
+_SHARED_SEED = "_shared_seed"
+_ITERATOR_FINISHED = "_iterator_finished"
+
+
+def _try_to_deserialize(obj, state_dict):
+    """Helper function to deserialize stateful objects."""
+    if state_dict is not None and isinstance(obj, Stateful):
+        obj.load_state_dict(state_dict)
+    return obj
 
 
 class _DatasetKind:
@@ -196,6 +213,14 @@ class DataLoader(Generic[_T_co]):
             will be used as the device if ``pin_memory=True``.
         in_order (bool, optional): If ``False``, the data loader will not enforce that batches
             are returned in a first-in, first-out order. Only applies when ``num_workers > 0``. (default: ``True``)
+        stateful (bool, optional): If ``True``, the data loader will support state_dict/load_state_dict
+            methods for mid-epoch checkpointing. This adds some overhead but enables resuming
+            training from any point. (default: ``False``)
+        snapshot_every_n_steps (int, optional): When stateful=True, defines how often the state is
+            transferred from the dataloader workers to the dataloader. By default, it is set to ``1``,
+            i.e., state is transferred every step. If the state is large, this value can be increased
+            (and ideally set to the frequency of training checkpointing) to reduce the overhead of
+            transferring state every step. (default: ``1``)
 
 
     .. warning:: If the ``spawn`` start method is used, :attr:`worker_init_fn`
@@ -260,6 +285,8 @@ class DataLoader(Generic[_T_co]):
         persistent_workers: bool = False,
         pin_memory_device: str = "",
         in_order: bool = True,
+        stateful: bool = False,
+        snapshot_every_n_steps: int = 1,
     ) -> None:
         torch._C._log_api_usage_once("python.data_loader")
 
@@ -294,6 +321,16 @@ class DataLoader(Generic[_T_co]):
         self.worker_init_fn = worker_init_fn
         self.multiprocessing_context = multiprocessing_context
         self.in_order = in_order
+
+        # Stateful functionality
+        self.stateful = stateful
+        self.snapshot_every_n_steps = snapshot_every_n_steps
+        self.next_iter_state: Optional[Dict[str, Any]] = None
+        # When a state_dict is requested before __iter__ is called,
+        # we create the __iter__ so we can get a copy of the initial state from
+        # its workers. In those cases, we can avoid creating a new multiprocessing
+        # iterator on the next __iter__ call, and this flag is used for those cases.
+        self._initial_iter_for_state_dict = False
 
         # Adds forward compatibilities so classic DataLoader can work with DataPipes:
         #   _DataPipeSerializationWrapper container makes it easier to serialize without redefining pickler
@@ -421,11 +458,22 @@ class DataLoader(Generic[_T_co]):
         torch.set_vital("Dataloader", "enabled", "True")  # type: ignore[attr-defined]
 
     def _get_iterator(self) -> _BaseDataLoaderIter:
+        if self.stateful:
+            return self._get_stateful_iterator()
+
         if self.num_workers == 0:
             return _SingleProcessDataLoaderIter(self)
         else:
             self.check_worker_number_rationality()
             return _MultiProcessingDataLoaderIter(self)
+
+    def _get_stateful_iterator(self) -> _BaseDataLoaderIter:
+        """Create a stateful iterator that supports state_dict/load_state_dict."""
+        if self.num_workers == 0:
+            return _StatefulSingleProcessDataLoaderIter(self, self.next_iter_state)
+        else:
+            self.check_worker_number_rationality()
+            return _StatefulMultiProcessingDataLoaderIter(self, self.next_iter_state)
 
     @property
     def multiprocessing_context(self):
@@ -485,14 +533,76 @@ class DataLoader(Generic[_T_co]):
         # However, in the case of a multiple workers iterator
         # the iterator is only created once in the lifetime of the
         # DataLoader object so that workers can be reused
-        if self.persistent_workers and self.num_workers > 0:
+        if self._initial_iter_for_state_dict:
+            self._initial_iter_for_state_dict = False
+            assert self._iterator is not None
+        elif self.persistent_workers and self.num_workers > 0:
             if self._iterator is None:
                 self._iterator = self._get_iterator()
             else:
                 self._iterator._reset(self)
-            return self._iterator
         else:
-            return self._get_iterator()
+            self._iterator = self._get_iterator()
+
+        if (
+            self.stateful
+            and self._iterator is not None
+            and hasattr(self._iterator, "_finished")
+            and self._iterator._finished
+        ):
+            if self.persistent_workers:
+                self._iterator._reset(self)
+            else:
+                self._iterator = self._get_iterator()
+
+        return self._iterator
+
+    def state_dict(self) -> Dict[str, Any]:
+        """
+        Return the state of the dataloader for checkpointing purposes.
+
+        Raises:
+            RuntimeError: If the dataloader was not created with stateful=True
+        """
+        if not self.stateful:
+            raise RuntimeError(
+                "DataLoader.state_dict() requires stateful=True. "
+                "Create DataLoader with DataLoader(..., stateful=True)"
+            )
+
+        if self._iterator is None:
+            self._iterator = self._get_iterator()
+            self._initial_iter_for_state_dict = True
+
+        if hasattr(self._iterator, "state_dict"):
+            return self._iterator.state_dict()
+        else:
+            raise RuntimeError(
+                "DataLoader iterator does not support state_dict(). "
+                "This should not happen with stateful=True."
+            )
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """
+        Load the state of the dataloader from a checkpoint.
+
+        Args:
+            state_dict: The state dictionary returned by state_dict()
+
+        Raises:
+            RuntimeError: If the dataloader was not created with stateful=True
+        """
+        if not self.stateful:
+            raise RuntimeError(
+                "DataLoader.load_state_dict() requires stateful=True. "
+                "Create DataLoader with DataLoader(..., stateful=True)"
+            )
+
+        self._iterator = None
+        self._initial_iter_for_state_dict = False
+        if state_dict == {}:
+            return
+        self.next_iter_state = state_dict
 
     @property
     def _auto_collation(self):
@@ -1653,3 +1763,917 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
 
     def __del__(self):
         self._shutdown_workers()
+
+
+class _StatefulBaseDataLoaderIter(_BaseDataLoaderIter):
+    """Base class for stateful dataloader iterators."""
+
+    def __init__(self, loader: DataLoader) -> None:
+        super().__init__(loader)
+        self._sampler_iter_yielded = 0
+        self._finished = False
+
+    def _reset(self, loader, first_iter=False):
+        super()._reset(loader, first_iter)
+        self._sampler_iter_yielded = 0
+        self._finished = False
+
+    def _next_index(self):
+        idx = super()._next_index()  # may raise StopIteration
+        self._sampler_iter_yielded += 1
+        return idx
+
+    def state_dict(self):
+        """Return the state dictionary of the iterator."""
+        raise NotImplementedError
+
+    def __next__(self):
+        try:
+            return super().__next__()
+        except StopIteration:
+            self._finished = True
+            raise
+
+
+class _StatefulSingleProcessDataLoaderIter(_StatefulBaseDataLoaderIter):
+    """Single-process stateful dataloader iterator."""
+
+    _NUM_YIELDED = "_num_yielded"
+
+    def __init__(self, loader, next_iter_state=None):
+        super().__init__(loader)
+        assert self._timeout == 0
+        assert self._num_workers == 0
+
+        # Adds forward compatibilities so classic DataLoader can work with DataPipes:
+        #   Taking care of distributed sharding
+        if isinstance(self._dataset, (IterDataPipe, MapDataPipe)):
+            # For BC, use default SHARDING_PRIORITIES
+            torch.utils.data.graph_settings.apply_sharding(
+                self._dataset, self._world_size, self._rank
+            )
+
+        if next_iter_state is not None:
+            self.load_state_dict(next_iter_state)
+        else:
+            self._dataset_fetcher = _DatasetKind.create_fetcher(
+                self._dataset_kind,
+                self._dataset,
+                self._auto_collation,
+                self._collate_fn,
+                self._drop_last,
+            )
+
+    def _next_data(self):
+        index = self._next_index()  # may raise StopIteration
+        data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
+        if self._pin_memory:
+            data = _utils.pin_memory.pin_memory(data, self._pin_memory_device)
+        return data
+
+    def state_dict(self):
+        """Return the state dictionary for checkpointing."""
+        if self._dataset_kind == _DatasetKind.Iterable:
+            fetcher_state = {
+                "_dataset_iter_state": try_to_serialize(
+                    self._dataset_fetcher.dataset_iter
+                ),
+                "_fetcher_ended": self._dataset_fetcher.ended,
+            }
+            dataset_state = None
+            if self._dataset_fetcher.dataset_iter is not self._dataset_fetcher.dataset:
+                dataset_state = try_to_serialize(self._dataset_fetcher.dataset)
+        else:
+            fetcher_state = None
+            dataset_state = try_to_serialize(self._dataset_fetcher.dataset)
+
+        state_dict = {
+            _INDEX_SAMPLER_STATE: try_to_serialize(self._index_sampler),
+            _SAMPLER_ITER_STATE: try_to_serialize(self._sampler_iter),
+            _SAMPLER_ITER_YIELDED: self._sampler_iter_yielded,
+            self._NUM_YIELDED: self._num_yielded,
+            _ITERABLEDATASET_LEN_CALLED: self._IterableDataset_len_called,
+            _SHARED_SEED: self._shared_seed,
+            "_fetcher_state": fetcher_state,
+            "_dataset_state": dataset_state,
+            _ITERATOR_FINISHED: self._finished,
+        }
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        """Load state from a checkpoint."""
+        assert (
+            self._NUM_YIELDED in state_dict
+        ), f"State doesn't contain key '{self._NUM_YIELDED}' expected for single process dataloader"
+
+        self._sampler_iter_yielded = state_dict[_SAMPLER_ITER_YIELDED]
+
+        # Try to restore from either _index_sampler state_dict or _sampler_iter state_dict
+        if isinstance(self._index_sampler, Stateful) or isinstance(
+            self._sampler_iter, Stateful
+        ):
+            self._index_sampler = _try_to_deserialize(
+                self._index_sampler, state_dict[_INDEX_SAMPLER_STATE]
+            )
+            self._sampler_iter = iter(self._index_sampler)
+            if state_dict[_SAMPLER_ITER_STATE] is not None:
+                self._sampler_iter = _try_to_deserialize(
+                    self._sampler_iter, state_dict[_SAMPLER_ITER_STATE]
+                )
+        else:
+            if not isinstance(self._index_sampler, _InfiniteConstantSampler):
+                # Fallback to fastforward
+                self._sampler_iter = itertools.islice(
+                    self._index_sampler, self._sampler_iter_yielded, None
+                )
+
+        self._num_yielded = state_dict[self._NUM_YIELDED]
+        self._IterableDataset_len_called = state_dict[_ITERABLEDATASET_LEN_CALLED]
+        self._shared_seed = state_dict[_SHARED_SEED]
+
+        # Always restore in this order:
+        #  1. try to restore dataset state
+        #  2. generate dataset iterator
+        #  3. try to restore iterator state
+        if state_dict["_dataset_state"] is not None and isinstance(
+            self._dataset, Stateful
+        ):
+            self._dataset = _try_to_deserialize(
+                self._dataset, state_dict["_dataset_state"]
+            )
+
+        self._dataset_fetcher = _DatasetKind.create_fetcher(
+            self._dataset_kind,
+            self._dataset,
+            self._auto_collation,
+            self._collate_fn,
+            self._drop_last,
+        )
+
+        if self._dataset_kind == _DatasetKind.Iterable:
+            # If either dataset or it's iter is stateful, we don't fast-forward
+            if isinstance(self._dataset, Stateful) or isinstance(
+                self._dataset_fetcher.dataset_iter, Stateful
+            ):
+                if state_dict["_fetcher_state"] is not None:
+                    if state_dict["_fetcher_state"]["_dataset_iter_state"] is not None:
+                        self._dataset_fetcher.dataset_iter = _try_to_deserialize(
+                            self._dataset_fetcher.dataset_iter,
+                            state_dict["_fetcher_state"]["_dataset_iter_state"],
+                        )
+                    self._dataset_fetcher.ended = state_dict["_fetcher_state"][
+                        "_fetcher_ended"
+                    ]
+            else:
+                # No state, just try to fastforward
+                if self._num_yielded > 0:
+                    logger.warning(
+                        f"Neither dataset nor iter(dataset) defines state_dict/load_state_dict so we are "
+                        f"naively fast-forwarding your dataset by {self._num_yielded} steps. For more efficient "
+                        f"resumes, please implement `state_dict` and `load_state_dict` in your IterableDataset and/or iterator."
+                    )
+                    for _ in range(self._num_yielded):
+                        next(self)
+        self._finished = state_dict[_ITERATOR_FINISHED]
+
+
+class _StatefulMultiProcessingDataLoaderIter(_StatefulBaseDataLoaderIter):
+    """Multi-process stateful dataloader iterator."""
+
+    _last_yielded_worker_id: int
+    _NUM_WORKERS = "_num_workers"
+    _SNAPSHOT = "_snapshot"
+    _MAIN_SNAPSHOT = "_main_snapshot"
+    _WORKER_SNAPSHOTS = "_worker_snapshots"
+    _SNAPSHOT_STEP = "_snapshot_step"
+    _STEPS_SINCE_SNAPSHOT = "_steps_since_snapshot"
+    _LAST_YIELDED_WORKER_ID = "_last_yielded_worker_id"
+    _BASE_SEED = "_base_seed"
+
+    def __init__(self, loader, next_iter_state):
+        super().__init__(loader)
+
+        self._snapshot_interval = loader.snapshot_every_n_steps
+        self._prefetch_factor = loader.prefetch_factor
+        self._in_order = loader.in_order
+
+        assert self._num_workers > 0
+        assert self._prefetch_factor > 0
+
+        if loader.multiprocessing_context is None:
+            multiprocessing_context = torch.multiprocessing
+        else:
+            multiprocessing_context = loader.multiprocessing_context
+
+        self._worker_init_fn = loader.worker_init_fn
+
+        # Adds forward compatibilities so classic DataLoader can work with DataPipes:
+        #   Additional worker init function will take care of sharding in MP and Distributed
+        if isinstance(self._dataset, (IterDataPipe, MapDataPipe)):
+            self._worker_init_fn = functools.partial(
+                _sharding_worker_init_fn,
+                self._worker_init_fn,
+                self._world_size,
+                self._rank,
+            )
+
+        # No certainty which module multiprocessing_context is
+        self._worker_result_queue = multiprocessing_context.Queue()  # type: ignore[var-annotated]
+        self._worker_pids_set = False
+        self._shutdown = False
+        self._workers_done_event = multiprocessing_context.Event()
+
+        self._index_queues = []
+        self._workers = []
+
+        # Import stateful worker components
+        from ._utils.worker import _IncrementalWorkerState, _stateful_worker_loop
+
+        worker_states = {self._worker_key(i): None for i in range(self._num_workers)}
+        if next_iter_state is not None:
+            assert (
+                self._SNAPSHOT in next_iter_state
+            ), f"State doesn't contain key '{self._SNAPSHOT}' expected for multiprocess dataloader"
+            wstates = next_iter_state[self._SNAPSHOT].get(self._WORKER_SNAPSHOTS, {})
+            assert set(map(self._worker_key, range(len(wstates)))) == set(
+                wstates.keys()
+            ), (
+                len(wstates),
+                wstates.keys(),
+            )
+            for worker_key, sd in wstates.items():
+                worker_states[worker_key] = sd
+            self._base_seed = next_iter_state[self._SNAPSHOT][self._MAIN_SNAPSHOT].get(
+                self._BASE_SEED, self._base_seed
+            )
+            self._shared_seed = next_iter_state[self._SNAPSHOT][
+                self._MAIN_SNAPSHOT
+            ].get(_SHARED_SEED, self._shared_seed)
+
+        for i in range(self._num_workers):
+            # No certainty which module multiprocessing_context is
+            index_queue = multiprocessing_context.Queue()  # type: ignore[var-annotated]
+            # Need to `cancel_join_thread` here!
+            index_queue.cancel_join_thread()
+
+            w = multiprocessing_context.Process(
+                target=_stateful_worker_loop,
+                args=(
+                    self._dataset_kind,
+                    self._dataset,
+                    index_queue,
+                    self._worker_result_queue,
+                    self._workers_done_event,
+                    self._auto_collation,
+                    self._collate_fn,
+                    self._drop_last,
+                    self._base_seed,
+                    self._worker_init_fn,
+                    i,
+                    self._num_workers,
+                    self._persistent_workers,
+                    self._shared_seed,
+                    worker_states[self._worker_key(i)],
+                ),
+            )
+            w.daemon = True
+            w.start()
+            self._index_queues.append(index_queue)
+            self._workers.append(w)
+
+        if self._pin_memory:
+            self._pin_memory_thread_done_event = threading.Event()
+            # Queue is not type-annotated
+            self._data_queue = queue.Queue()  # type: ignore[var-annotated]
+            current_device_id = torch.accelerator.current_device_index()
+            pin_memory_thread = threading.Thread(
+                target=_utils.pin_memory._pin_memory_loop,
+                args=(
+                    self._worker_result_queue,
+                    self._data_queue,
+                    current_device_id,
+                    self._pin_memory_thread_done_event,
+                    self._pin_memory_device,
+                ),
+            )
+            pin_memory_thread.daemon = True
+            pin_memory_thread.start()
+            self._pin_memory_thread = pin_memory_thread
+        else:
+            self._data_queue = self._worker_result_queue  # type: ignore[assignment]
+
+        # In some rare cases, persistent workers (daemonic processes)
+        # would be terminated before `__del__` of iterator is invoked
+        # when main process exits
+        if self._persistent_workers and self._pin_memory:
+            import atexit
+
+            for w in self._workers:
+                atexit.register(
+                    _StatefulMultiProcessingDataLoaderIter._clean_up_worker, w
+                )
+
+        # .pid can be None only before process is spawned (not the case, so ignore)
+        _utils.signal_handling._set_worker_pids(id(self), tuple(w.pid for w in self._workers))  # type: ignore[misc]
+        _utils.signal_handling._set_SIGCHLD_handler()
+        self._worker_pids_set = True
+
+        # Initialize snapshot management
+        import collections
+
+        self._snapshot, self._main_snapshots = {}, collections.deque()  # type: ignore[var-annotated]
+        self._worker_snapshots = {
+            key: _IncrementalWorkerState(state) for key, state in worker_states.items()
+        }
+        self._reset(loader, first_iter=True, prime_prefetch=next_iter_state is None)
+
+        # Try to restore main state
+        if next_iter_state is not None:
+            self._restore_main_state(
+                next_iter_state[self._SNAPSHOT][self._MAIN_SNAPSHOT]
+            )
+            self._num_yielded = next_iter_state[self._SNAPSHOT][self._SNAPSHOT_STEP]
+
+            self._update_snapshot(
+                snapshot_step=next_iter_state[self._SNAPSHOT][self._SNAPSHOT_STEP],
+                last_yielded_worker_id=next_iter_state[self._SNAPSHOT][
+                    self._LAST_YIELDED_WORKER_ID
+                ],
+                num_workers=self._num_workers,
+                main_snapshot=next_iter_state[self._SNAPSHOT][self._MAIN_SNAPSHOT],
+                worker_snapshots=self._worker_snapshots,
+            )
+
+            # Restore worker queue cycle position
+            self._last_yielded_worker_id = next_iter_state[self._SNAPSHOT][
+                self._LAST_YIELDED_WORKER_ID
+            ]
+            for _ in range(self._last_yielded_worker_id + 1):
+                next(self._worker_queue_idx_cycle)
+
+            # Refill the prefetch pipeline
+            for _ in range(self._prefetch_factor * self._num_workers):
+                self._try_put_index()
+
+            # Critical: Fast-forward by steps since last snapshot
+            for _ in range(next_iter_state[self._STEPS_SINCE_SNAPSHOT]):
+                next(self)
+
+            self._finished = next_iter_state[_ITERATOR_FINISHED]
+
+    def _worker_key(self, worker_id: int) -> str:
+        return f"worker_{worker_id}"
+
+    def state_dict(self):
+        """Return the state dictionary for checkpointing."""
+        if not self._in_order:
+            logger.warning(
+                "using in_order=False with multiple workers does not give any guarantees for state management "
+                "and loading from a checkpoint may not work as expected."
+            )
+        steps_since_snapshot = self._num_yielded - self._snapshot[self._SNAPSHOT_STEP]
+        state_dict = {
+            self._SNAPSHOT: self._snapshot,
+            self._STEPS_SINCE_SNAPSHOT: steps_since_snapshot,
+            _ITERATOR_FINISHED: self._finished,
+        }
+        return state_dict
+
+    def _update_snapshot(
+        self,
+        snapshot_step: int,
+        last_yielded_worker_id: int,
+        num_workers: int,
+        main_snapshot: Dict[str, Any],
+        worker_snapshots: Dict[str, Any],
+    ):
+        self._snapshot = {
+            self._SNAPSHOT_STEP: snapshot_step,
+            self._LAST_YIELDED_WORKER_ID: last_yielded_worker_id,
+            self._MAIN_SNAPSHOT: main_snapshot,
+            self._WORKER_SNAPSHOTS: {
+                key: worker_state.get_state()
+                for key, worker_state in worker_snapshots.items()
+            },
+        }
+
+    def _get_main_state(self):
+        return {
+            self._NUM_WORKERS: self._num_workers,
+            _SAMPLER_ITER_STATE: try_to_serialize(self._sampler_iter),
+            _INDEX_SAMPLER_STATE: try_to_serialize(self._index_sampler),
+            _SAMPLER_ITER_YIELDED: self._sampler_iter_yielded,
+            _ITERABLEDATASET_LEN_CALLED: self._IterableDataset_len_called,
+            _SHARED_SEED: self._shared_seed,
+            self._BASE_SEED: self._base_seed,
+        }
+
+    def _restore_main_state(self, state_dict):
+        assert self._num_workers == state_dict[self._NUM_WORKERS]
+        # Try to restore from either _index_sampler state_dict or _sampler_iter state_dict
+        self._sampler_iter_yielded = state_dict[_SAMPLER_ITER_YIELDED]
+        if isinstance(self._index_sampler, Stateful) or isinstance(
+            self._sampler_iter, Stateful
+        ):
+            self._index_sampler = _try_to_deserialize(
+                self._index_sampler, state_dict[_INDEX_SAMPLER_STATE]
+            )
+            self._sampler_iter = iter(self._index_sampler)
+            if state_dict[_SAMPLER_ITER_STATE] is not None:
+                self._sampler_iter = _try_to_deserialize(
+                    self._sampler_iter, state_dict[_SAMPLER_ITER_STATE]
+                )
+        else:
+            if not isinstance(self._index_sampler, _InfiniteConstantSampler):
+                # Fallback to fastforward
+                self._sampler_iter = itertools.islice(
+                    self._index_sampler, self._sampler_iter_yielded, None
+                )
+        self._IterableDataset_len_called = state_dict[_ITERABLEDATASET_LEN_CALLED]
+        self._shared_seed = state_dict[_SHARED_SEED]
+        self._base_seed = state_dict[self._BASE_SEED]
+
+    def __del__(self):
+        self._shutdown_workers()
+
+    @staticmethod
+    def _clean_up_worker(w):
+        try:
+            w.join(timeout=_utils.MP_STATUS_CHECK_INTERVAL)
+        finally:
+            if w.is_alive():
+                w.terminate()
+
+    def _reset(self, loader, first_iter=False, prime_prefetch=True):
+        super()._reset(loader, first_iter)
+        self._send_idx = 0  # idx of the next task to be sent to workers
+        self._rcvd_idx = 0  # idx of the next task to be returned in __next__
+        # information about data not yet yielded, i.e., tasks w/ indices in range [rcvd_idx, send_idx).
+        # map: task idx => - (worker_id,)        if data isn't fetched (outstanding)
+        #                  \ (worker_id, data)   if data is already fetched (out-of-order)
+        self._task_info = {}
+        self._tasks_outstanding = (
+            0  # always equal to count(v for v in task_info.values() if len(v) == 1)
+        )
+        # A list of booleans representing whether each worker still has work to
+        # do, i.e., not having exhausted its iterable dataset object. It always
+        # contains all `True`s if not using an iterable-style dataset
+        # (i.e., if kind != Iterable).
+        # Not that this indicates that a worker still has work to do *for this epoch*.
+        # It does not mean that a worker is dead. In case of `_persistent_workers`,
+        # the worker will be reset to available in the next epoch.
+        self._workers_status = [True for i in range(self._num_workers)]
+        # A list of integers representing how many tasks are outstanding for each worker
+        # Incremented when a task is dispatched to the worker
+        # Decremented when that data has been given to the main thread
+        # Each worker should have at most self._prefetch_factor tasks outstanding
+        self._workers_num_tasks = [0 for i in range(self._num_workers)]
+        # Reset the worker queue cycle so it resumes next epoch at worker 0
+        self._worker_queue_idx_cycle = itertools.cycle(range(self._num_workers))
+        remaining = self._num_workers
+
+        if first_iter:
+            # Import worker classes
+            from ._utils.worker import _AckStartup
+
+            # Request the initial state_dict
+            for i in range(self._num_workers):
+                self._index_queues[i].put(_AckStartup(i, None))  # type: ignore[arg-type]
+
+            while remaining > 0:
+                _, data = self._get_data()
+                if not all(self._workers_status):
+                    raise ValueError(
+                        f"A worker has failed during startup! {self._workers_status}"
+                    )
+                elif isinstance(data, _AckStartup):
+                    if isinstance(data.initial_state, ExceptionWrapper):
+                        data.initial_state.reraise()
+
+                    if data.is_delta:
+                        self._worker_snapshots[self._worker_key(data.worker_id)].apply_delta(data.initial_state)  # type: ignore[arg-type]
+                    else:
+                        from ._utils.worker import _IncrementalWorkerState
+
+                        self._worker_snapshots[
+                            self._worker_key(data.worker_id)
+                        ] = _IncrementalWorkerState(
+                            data.initial_state  # type: ignore[arg-type]
+                        )
+                    remaining -= 1
+                else:
+                    raise ValueError(
+                        f"Invalid response from worker after startup: {data}"
+                    )
+        else:
+            # We resume the prefetching in case it was enabled
+            for idx in range(self._num_workers):
+                from ._utils.worker import _ResumeIteration
+
+                self._index_queues[idx].put(_ResumeIteration(self._shared_seed))
+            resume_iteration_cnt = self._num_workers
+            while resume_iteration_cnt > 0:
+                return_idx, data = self._get_data()
+                if not all(self._workers_status):
+                    raise ValueError(
+                        f"A worker has failed during Resume! {self._workers_status}"
+                    )
+                if isinstance(return_idx, _utils.worker._ResumeIteration):
+                    from ._utils.worker import _AckStartup
+
+                    assert isinstance(data, _AckStartup), (return_idx, data)
+                    if isinstance(data.initial_state, ExceptionWrapper):
+                        data.initial_state.reraise()
+                    assert data.initial_state is not None, data
+                    from ._utils.worker import _IncrementalWorkerState
+
+                    self._worker_snapshots[
+                        self._worker_key(data.worker_id)
+                    ] = _IncrementalWorkerState(
+                        data.initial_state  # type: ignore[arg-type]
+                    )
+                    resume_iteration_cnt -= 1
+
+        # Reset state variables
+        import collections
+
+        self._main_snapshots = collections.deque()
+        self._last_yielded_worker_id = self._num_workers - 1
+        self._update_snapshot(
+            snapshot_step=0,
+            last_yielded_worker_id=self._num_workers - 1,
+            num_workers=self._num_workers,
+            main_snapshot=self._get_main_state(),
+            worker_snapshots=self._worker_snapshots,
+        )
+
+        if prime_prefetch:
+            # prime the prefetch loop
+            for _ in range(self._prefetch_factor * self._num_workers):
+                self._try_put_index()
+
+    def _try_get_data(self, timeout=_utils.MP_STATUS_CHECK_INTERVAL):
+        # Tries to fetch data from `self._data_queue` once for a given timeout.
+        # This can also be used as inner loop of fetching without timeout, with
+        # the sender status as the loop condition.
+        #
+        # This raises a `RuntimeError` if any worker died expectedly. This error
+        # can come from either the SIGCHLD handler in `_utils/signal_handling.py`
+        # (only for non-Windows platforms), or the manual check below on errors
+        # and timeouts.
+        #
+        # Returns a 2-tuple:
+        #   (bool: whether successfully get data, any: data if successful else None)
+        try:
+            data = self._data_queue.get(timeout=timeout)
+            return (True, data)
+        except Exception as e:
+            # At timeout and error, we manually check whether any worker has
+            # failed. Note that this is the only mechanism for Windows to detect
+            # worker failures.
+            failed_workers = []
+            for worker_id, w in enumerate(self._workers):
+                if self._workers_status[worker_id] and not w.is_alive():
+                    failed_workers.append(w)
+                    self._mark_worker_as_unavailable(worker_id)
+            if len(failed_workers) > 0:
+                pids_str = ", ".join(str(w.pid) for w in failed_workers)
+                raise RuntimeError(
+                    f"DataLoader worker (pid(s) {pids_str}) exited unexpectedly"
+                ) from e
+            if isinstance(e, queue.Empty):
+                return (False, None)
+            import errno
+            import tempfile
+
+            try:
+                # Raise an exception if we are this close to the FDs limit.
+                # Apparently, trying to open only one file is not a sufficient
+                # test.
+                # See NOTE [ DataLoader on Linux and open files limit ]
+                fds_limit_margin = 10
+                [tempfile.NamedTemporaryFile() for i in range(fds_limit_margin)]
+            except OSError as e:
+                if e.errno == errno.EMFILE:
+                    raise RuntimeError(
+                        "Too many open files. Communication with the"
+                        " workers is no longer possible. Please increase the"
+                        " limit using `ulimit -n` in the shell or change the"
+                        " sharing strategy by calling"
+                        " `torch.multiprocessing.set_sharing_strategy('file_system')`"
+                        " at the beginning of your code"
+                    ) from None
+            raise
+
+    def _get_data(self):
+        # Fetches data from `self._data_queue`.
+        #
+        # We check workers' status every `MP_STATUS_CHECK_INTERVAL` seconds,
+        # which we achieve by running `self._try_get_data(timeout=MP_STATUS_CHECK_INTERVAL)`
+        # in a loop. This is the only mechanism to detect worker failures for
+        # Windows. For other platforms, a SIGCHLD handler is also used for
+        # worker failure detection.
+        #
+        # If `pin_memory=True`, we also need check if `pin_memory_thread` had
+        # died at timeouts.
+        if self._timeout > 0:
+            success, data = self._try_get_data(self._timeout)
+            if success:
+                return data
+            else:
+                raise RuntimeError(
+                    f"DataLoader timed out after {self._timeout} seconds"
+                )
+        elif self._pin_memory:
+            while self._pin_memory_thread.is_alive():
+                success, data = self._try_get_data()
+                if success:
+                    return data
+            else:
+                # while condition is false, i.e., pin_memory_thread died.
+                raise RuntimeError("Pin memory thread exited unexpectedly")
+            # In this case, `self._data_queue` is a `queue.Queue`,. But we don't
+            # need to call `.task_done()` because we don't use `.join()`.
+        else:
+            while True:
+                success, data = self._try_get_data()
+                if success:
+                    return data
+
+    def _next_data(self):
+        while True:
+            # If the worker responsible for `self._rcvd_idx` has already ended
+            # and was unable to fulfill this task (due to exhausting an `IterableDataset`),
+            # we try to advance `self._rcvd_idx` to find the next valid index.
+            #
+            # This part needs to run in the loop because both the `self._get_data()`
+            # call and `_IterableDatasetStopIteration` check below can mark
+            # extra worker(s) as dead.
+            while self._rcvd_idx < self._send_idx:
+                info = self._task_info.get(self._rcvd_idx, None)
+                if info:
+                    worker_id = info[0]
+                    if (
+                        len(info) == 2 or self._workers_status[worker_id]
+                    ):  # has data or is still active
+                        break
+                    del self._task_info[self._rcvd_idx]
+                self._rcvd_idx += 1
+            else:
+                # no valid `self._rcvd_idx` is found (i.e., didn't break)
+                if not self._persistent_workers:
+                    self._shutdown_workers()
+                raise StopIteration
+
+            # Now `self._rcvd_idx` is the batch index we want to fetch
+
+            # Check if the next sample has already been generated
+            if len(self._task_info[self._rcvd_idx]) == 2:
+                data, worker_id, state_dict = self._task_info.pop(self._rcvd_idx)[1]
+                if isinstance(data, _utils.worker._IterableDatasetStopIteration):
+                    self._update_worker_snapshot(
+                        self._worker_key(data.worker_id), state_dict
+                    )
+                    self._rcvd_idx += 1
+                    continue
+                else:
+                    self._rcvd_idx += 1
+                    return self._process_data(data, worker_id, state_dict)
+
+            assert not self._shutdown and self._tasks_outstanding > 0
+            idx, (data, worker_id, state_dict) = self._get_data()
+            self._tasks_outstanding -= 1
+            if self._dataset_kind == _DatasetKind.Iterable:
+                # Check for _IterableDatasetStopIteration
+                if isinstance(data, _utils.worker._IterableDatasetStopIteration):
+                    if self._persistent_workers:
+                        self._workers_status[data.worker_id] = False
+                    else:
+                        self._mark_worker_as_unavailable(data.worker_id)
+                    assert (
+                        state_dict is not None
+                    ), "StopIteration should always be accompanied by a state_dict"
+                    self._try_put_index()
+                    # We want to process states until we get to that position
+                    # in the worker cycle, therefore if out-of-order we want
+                    # to store the StopIteration and process it later
+
+            if idx != self._rcvd_idx:
+                # store out-of-order samples
+                if not self._in_order:
+                    # don't store it for later, process now
+                    if isinstance(data, _utils.worker._IterableDatasetStopIteration):
+                        self._update_worker_snapshot(
+                            self._worker_key(data.worker_id), state_dict
+                        )
+                        continue
+                    del self._task_info[idx]
+                    return self._process_data(data, worker_id, state_dict)
+                self._task_info[idx] += ((data, worker_id, state_dict),)
+            else:
+                del self._task_info[idx]
+                if isinstance(data, _utils.worker._IterableDatasetStopIteration):
+                    self._update_worker_snapshot(
+                        self._worker_key(data.worker_id), state_dict
+                    )
+                    self._rcvd_idx += 1
+                    continue
+                else:
+                    self._rcvd_idx += 1
+                    return self._process_data(data, worker_id, state_dict)
+
+    def _try_put_index(self):
+        max_tasks = self._prefetch_factor * self._num_workers
+        assert self._tasks_outstanding < max_tasks
+
+        try:
+            index = self._next_index()
+            snapshot_main = False
+            snapshot = False
+            if not self._snapshot_interval:
+                pass
+            elif self._dataset_kind == _DatasetKind.Iterable:
+                x = self._num_yielded % self._snapshot_interval
+                hi = x + 1 + self._num_workers * self._prefetch_factor
+                if hi >= self._snapshot_interval:
+                    snapshot_main = True
+                if hi + self._num_workers >= self._snapshot_interval:
+                    snapshot = True
+            else:
+                if self._sampler_iter_yielded % self._snapshot_interval == 0:
+                    # Snapshot sampler
+                    snapshot_main = True
+                if (
+                    (self._sampler_iter_yielded - 1) % self._snapshot_interval
+                ) + self._num_workers >= self._snapshot_interval:
+                    snapshot = True
+        except StopIteration:
+            return
+        for _ in range(self._num_workers):  # find the next active worker, if any
+            worker_queue_idx = next(self._worker_queue_idx_cycle)
+            if self._workers_status[worker_queue_idx]:
+                if self._in_order:
+                    break
+                elif self._workers_num_tasks[worker_queue_idx] < max_tasks // sum(
+                    self._workers_status
+                ):
+                    # when self._in_order is False, distribute work to a worker if it has capacity
+                    # _workers_status is updated only in this thread, so the sum is guaranteed > 0
+                    break
+        else:
+            # not found (i.e., didn't break)
+            return
+
+        if snapshot_main:
+            assert snapshot
+            self._main_snapshots.append((self._send_idx, self._get_main_state()))
+
+        self._index_queues[worker_queue_idx].put((self._send_idx, (index, snapshot)))  # type: ignore[possibly-undefined]
+        self._task_info[self._send_idx] = (worker_queue_idx,)
+        self._workers_num_tasks[worker_queue_idx] += 1
+        self._tasks_outstanding += 1
+        self._send_idx += 1
+
+    def _process_data(self, data, worker_id, state_dict):
+        self._workers_num_tasks[worker_id] -= 1
+        self._try_put_index()
+        if isinstance(data, ExceptionWrapper):
+            data.reraise()
+        self._last_yielded_worker_id = worker_id
+        # Update latest worker state
+        if state_dict is not None:
+            from ._utils.worker import _WORKER_ID
+
+            # Use the worker_id from the state_dict if available, otherwise use the passed worker_id
+            actual_worker_id = state_dict.get(_WORKER_ID, worker_id)
+            self._update_worker_snapshot(self._worker_key(actual_worker_id), state_dict)
+        if self._snapshot_interval and (
+            (self._num_yielded + 1) % self._snapshot_interval == 0
+        ):
+            self._take_snapshot()
+        return data
+
+    def _update_worker_snapshot(self, worker_key, state_dict):
+        if state_dict is None:
+            return
+        self._worker_snapshots[worker_key].apply_delta(state_dict)
+
+    def _take_snapshot(self):
+        main_snapshot_idx = None
+        while len(self._main_snapshots) and (
+            self._main_snapshots[0][0] <= self._rcvd_idx - 1
+        ):
+            main_snapshot_idx, main_snapshot = self._main_snapshots.popleft()
+        if not self._in_order and main_snapshot_idx is None:
+            # in_order is False and no main snapshot is available as we're ahead of rcvd_idx
+            # we can't take a snapshot with the current implementation
+            return
+        assert main_snapshot_idx == self._rcvd_idx - 1, (
+            main_snapshot_idx,
+            self._rcvd_idx - 1,
+        )
+        self._update_snapshot(
+            self._num_yielded + 1,
+            self._last_yielded_worker_id,
+            self._num_workers,
+            main_snapshot,
+            self._worker_snapshots,
+        )
+
+    def _mark_worker_as_unavailable(self, worker_id, shutdown=False):
+        # Mark a worker as having finished its work e.g., due to
+        # exhausting an `IterableDataset`. This should be used only when this
+        # `_MultiProcessingDataLoaderIter` is going to continue running.
+
+        assert self._workers_status[worker_id] or self._persistent_workers or shutdown
+
+        # Signal termination to that specific worker.
+        q = self._index_queues[worker_id]
+        # Indicate that no more data will be put on this queue by the current
+        # process.
+        q.put(None)
+
+        # Note that we don't actually join the worker here, nor do we remove the
+        # worker's pid from C side struct because (1) joining may be slow, and
+        # (2) since we don't join, the worker may still raise error, and we
+        # prefer capturing those, rather than ignoring them, even though they
+        # are raised after the worker has finished its job.
+        # Joining is deferred to `_shutdown_workers`, which it is called when
+        # all workers finish their jobs (e.g., `IterableDataset` replicas) or
+        # when this iterator is garbage collected.
+
+        self._workers_status[worker_id] = False
+
+        assert self._workers_done_event.is_set() == shutdown
+
+    def _shutdown_workers(self):
+        # Called when shutting down this `_MultiProcessingDataLoaderIter`.
+        # See NOTE [ Data Loader Multiprocessing Shutdown Logic ] for details on
+        # the logic of this function.
+        if (
+            _utils is None
+            or _utils.python_exit_status is True
+            or _utils.python_exit_status is None
+        ):
+            # See (2) of the note. If Python is shutting down, do no-op.
+            return
+        # Normal exit when last reference is gone / iterator is depleted.
+        # See (1) and the second half of the note.
+        if not self._shutdown:
+            self._shutdown = True
+            try:
+                # Normal exit when last reference is gone / iterator is depleted.
+                # See (1) and the second half of the note.
+
+                # Exit `pin_memory_thread` first because exiting workers may leave
+                # corrupted data in `worker_result_queue` which `pin_memory_thread`
+                # reads from.
+                if hasattr(self, "_pin_memory_thread"):
+                    # Use hasattr in case error happens before we set the attribute.
+                    self._pin_memory_thread_done_event.set()
+                    # Send something to pin_memory_thread in case it is waiting
+                    # so that it can wake up and check `pin_memory_thread_done_event`
+                    self._worker_result_queue.put((None, None))
+                    self._pin_memory_thread.join()
+                    self._worker_result_queue.cancel_join_thread()
+                    self._worker_result_queue.close()
+
+                # Exit workers now.
+                self._workers_done_event.set()
+                for worker_id in range(len(self._workers)):
+                    # Get number of workers from `len(self._workers)` instead of
+                    # `self._num_workers` in case we error before starting all
+                    # workers.
+                    # If we are using workers_status with persistent_workers
+                    # we have to shut it down because the worker is paused
+                    if self._persistent_workers or self._workers_status[worker_id]:
+                        self._mark_worker_as_unavailable(worker_id, shutdown=True)
+                for w in self._workers:
+                    # We should be able to join here, but in case anything went
+                    # wrong, we set a timeout and if the workers fail to join,
+                    # they are killed in the `finally` block.
+                    w.join(timeout=_utils.MP_STATUS_CHECK_INTERVAL)
+                for q in self._index_queues:
+                    q.cancel_join_thread()
+                    q.close()
+            finally:
+                # Even though all this function does is putting into queues that
+                # we have called `cancel_join_thread` on, weird things can
+                # happen when a worker is killed by a signal, e.g., hanging in
+                # `Event.set()`. So we need to guard this with SIGCHLD handler,
+                # and remove pids from the C side data structure only at the
+                # end.
+                #
+                # FIXME: Unfortunately, for Windows, we are missing a worker
+                #        error detection mechanism here in this function, as it
+                #        doesn't provide a SIGCHLD handler.
+                if self._worker_pids_set:
+                    _utils.signal_handling._remove_worker_pids(id(self))
+                    self._worker_pids_set = False
+                for w in self._workers:
+                    if w.is_alive():
+                        # Existing mechanisms try to make the workers exit
+                        # peacefully, but in case that we unfortunately reach
+                        # here, which we shouldn't, (e.g., pytorch/pytorch#39570),
+                        # we kill the worker.
+                        w.terminate()
