@@ -1405,8 +1405,6 @@ except RuntimeError as e:
     # This case passes on s390x too.
     # please don't forget to remove this skip when remove the xfailIfLinux.
     @unittest.skipIf(IS_S390X, "Unexpectedly succeeds on s390x")
-    # https://github.com/pytorch/pytorch/issues/128551
-    @xfailIfLinux
     def test_segfault(self):
         p = ErrorTrackingProcess(target=_test_segfault)
         p.start()
@@ -3036,7 +3034,8 @@ class IntegrationTestDataLoaderDataPipe(TestCase):
                 self.assertEqual(sorted(dl_res[0]), sorted(dl_res[2]))
 
                 if dl._iterator is not None:
-                    dl._iterator._shutdown_workers()
+                    if num_workers > 0:
+                        dl._iterator._shutdown_workers()
                     dl._iterator = None
                 del dl
 
