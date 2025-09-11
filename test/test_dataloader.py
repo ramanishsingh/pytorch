@@ -2898,6 +2898,215 @@ except RuntimeError as e:
         ):
             dataloader = DataLoader(self.dataset, batch_size=2, num_workers=1000)
 
+    def test_stateful_dataloader_basic(self):
+        """Test basic state_dict/load_state_dict functionality with stateful=True"""
+        # Create a stateful dataloader
+        loader = DataLoader(self.dataset, batch_size=5, stateful=True, shuffle=False)
+          
+        # Test that state_dict works
+        state_dict = loader.state_dict()
+        self.assertIsInstance(state_dict, dict)
+          
+        # Test that we can consume some data
+        it = iter(loader)
+        batch1 = next(it)
+        batch2 = next(it)
+
+          
+        # Get state after consuming 2 batches
+        state_dict = loader.state_dict()
+        
+        batch3_original = next(it)
+        self.assertEqual(len(batch1[0]), 5)
+        self.assertEqual(len(batch2[0]), 5)
+
+          
+        # Create a new loader and resume from state
+        loader2 = DataLoader(self.dataset, batch_size=5, stateful=True, shuffle=False)
+        loader2.load_state_dict(state_dict)
+          
+        # Continue from where we left off
+        it2 = iter(loader2)
+        batch3 = next(it2)
+          
+
+    
+        self.assertTrue(torch.equal(batch3[0], batch3_original[0]))
+        self.assertTrue(torch.equal(batch3[1], batch3_original[1]))
+
+    def test_stateful_dataloader_resume_mid_epoch(self):
+        """Test resuming from the middle of an epoch"""
+        loader = DataLoader(self.dataset, batch_size=10, stateful=True, shuffle=False)
+          
+        # Consume some batches and track them
+        batches_before_checkpoint = []
+        it = iter(loader)
+          
+        for i in range(3):  # consume first 3 batches  
+            batch = next(it)
+            batches_before_checkpoint.append(batch)
+          
+        # Save state after consuming 3 batches
+        state_dict = loader.state_dict()
+        self.assertIsInstance(state_dict, dict)
+          
+        # Continue with original iterator and collect remaining batches
+        remaining_batches_original = []
+        for batch in it:
+            remaining_batches_original.append(batch)
+          
+        # Create new loader and resume from checkpoint
+        loader2 = DataLoader(self.dataset, batch_size=10, stateful=True, shuffle=False)
+        loader2.load_state_dict(state_dict)
+          
+        # Collect all batches from resumed loader
+        remaining_batches_resumed = []
+        for batch in loader2:
+            remaining_batches_resumed.append(batch)
+          
+        # Verify that resumed loader continues exactly where original left off
+        self.assertEqual(len(remaining_batches_original), len(remaining_batches_resumed))
+        for orig, resumed in zip(remaining_batches_original, remaining_batches_resumed):
+            self.assertTrue(torch.equal(orig[0], resumed[0]))
+            self.assertTrue(torch.equal(orig[1], resumed[1]))
+
+    def test_stateful_dataloader_multiple_epochs(self):
+        """Test state preservation across multiple epochs"""
+        loader = DataLoader(self.dataset, batch_size=20, stateful=True, shuffle=False)
+          
+        # Complete first epoch
+        epoch1_batches = []
+        for batch in loader:
+            epoch1_batches.append(batch)
+          
+        # Start second epoch, consume some batches
+        epoch2_partial = []
+        it = iter(loader)
+        for i in range(2):  # consume 2 batches from second epoch
+            batch = next(it)
+            epoch2_partial.append(batch)
+          
+        # Save state mid-second-epoch
+        state_dict = loader.state_dict()
+          
+        # Continue original and collect remaining batches
+        epoch2_remaining_original = []
+        for batch in it:
+            epoch2_remaining_original.append(batch)
+          
+        # Resume from checkpoint
+        loader2 = DataLoader(self.dataset, batch_size=20, stateful=True, shuffle=False)
+        loader2.load_state_dict(state_dict)
+          
+        epoch2_remaining_resumed = []
+        for batch in loader2:
+            epoch2_remaining_resumed.append(batch)
+          
+        # Verify resumed matches original continuation
+        self.assertEqual(len(epoch2_remaining_original), len(epoch2_remaining_resumed))
+        for orig, resumed in zip(epoch2_remaining_original, epoch2_remaining_resumed):
+            self.assertTrue(torch.equal(orig[0], resumed[0]))
+            self.assertTrue(torch.equal(orig[1], resumed[1]))
+
+    def test_stateful_dataloader_empty_state_dict(self):
+        """Test behavior with empty/initial state dict"""
+        loader = DataLoader(self.dataset, batch_size=5, stateful=True, shuffle=False)
+          
+        # Get initial state dict before consuming any data
+        initial_state = loader.state_dict()
+          
+        # Create new loader and load initial state
+        loader2 = DataLoader(self.dataset, batch_size=5, stateful=True, shuffle=False)
+        loader2.load_state_dict(initial_state)
+          
+        # Both should produce identical sequences
+        batches1 = list(loader)
+        batches2 = list(loader2)
+          
+        self.assertEqual(len(batches1), len(batches2))
+        for b1, b2 in zip(batches1, batches2):
+            self.assertTrue(torch.equal(b1[0], b2[0]))
+            self.assertTrue(torch.equal(b1[1], b2[1]))
+
+    def test_stateful_dataloader_end_of_epoch_resume(self):
+        """Test resuming exactly at epoch boundary"""
+        loader = DataLoader(self.dataset, batch_size=10, stateful=True, shuffle=False)
+          
+        # Consume entire first epoch
+        epoch1_batches = []
+        it1 = iter(loader)
+        for batch in it1:
+            epoch1_batches.append(batch)
+          
+        # At this point, the iterator should be finished
+        # Save state at end of epoch - this captures the "finished" state
+        state_dict = loader.state_dict()
+          
+        # Start new epoch with original loader - this should reset and start fresh
+        epoch2_original = []
+        for batch in loader:  # This creates a new iterator internally
+            epoch2_original.append(batch)
+          
+        # Resume from end-of-epoch checkpoint
+        loader2 = DataLoader(self.dataset, batch_size=10, stateful=True, shuffle=False)
+        loader2.load_state_dict(state_dict)
+          
+        # The resumed loader should also start a new epoch
+        epoch2_resumed = []
+        for batch in loader2:
+            epoch2_resumed.append(batch)
+          
+        # Verify second epoch matches (both should start from beginning)
+        self.assertEqual(len(epoch2_original), len(epoch2_resumed))
+        for orig, resumed in zip(epoch2_original, epoch2_resumed):
+            self.assertTrue(torch.equal(orig[0], resumed[0]))
+            self.assertTrue(torch.equal(orig[1], resumed[1]))
+          
+        # Both should start from index 0 again
+        if len(epoch2_original) > 0:
+            self.assertTrue(torch.equal(epoch2_original[0][1], torch.arange(0, 10)))
+
+
+    def test_stateful_dataloader_with_multiprocessing(self):
+        """Test stateful DataLoader with num_workers > 0"""
+        if not torch.multiprocessing.get_start_method(allow_none=True):
+            self.skipTest("Multiprocessing not available")
+              
+        loader = DataLoader(self.dataset, batch_size=5, stateful=True, 
+                          shuffle=False, num_workers=2)
+          
+        # Consume some batches
+        batches_before = []
+        it = iter(loader)
+        for i in range(3):
+            batch = next(it)
+            batches_before.append(batch)
+          
+        # Save state
+        state_dict = loader.state_dict()
+          
+        # Continue with original
+        remaining_original = []
+        for batch in it:
+            remaining_original.append(batch)
+          
+        # Resume with new loader
+        loader2 = DataLoader(self.dataset, batch_size=5, stateful=True,
+                           shuffle=False, num_workers=2)
+        loader2.load_state_dict(state_dict)
+          
+        remaining_resumed = []
+        for batch in loader2:
+            remaining_resumed.append(batch)
+          
+        # Verify continuation
+        self.assertEqual(len(remaining_original), len(remaining_resumed))
+        for orig, resumed in zip(remaining_original, remaining_resumed):
+            self.assertTrue(torch.equal(orig[0], resumed[0]))
+            self.assertTrue(torch.equal(orig[1], resumed[1]))
+          
+
+
 
 class TestDataLoaderDeviceType(TestCase):
     @parametrize(
