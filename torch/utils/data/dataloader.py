@@ -36,6 +36,7 @@ from torch.utils.data.sampler import (
     RandomSampler,
     Sampler,
     SequentialSampler,
+    StatefulBatchSampler,
 )
 from typing_extensions import Self
 
@@ -429,7 +430,11 @@ class DataLoader(Generic[_T_co]):
 
         if batch_size is not None and batch_sampler is None:
             # auto_collation without custom batch_sampler
-            batch_sampler = BatchSampler(sampler, batch_size, drop_last)
+            if self.stateful:
+
+                batch_sampler = StatefulBatchSampler(sampler, batch_size, drop_last)
+            else:
+                batch_sampler = BatchSampler(sampler, batch_size, drop_last)
 
         self.batch_size = batch_size
         self.drop_last = drop_last
@@ -470,10 +475,17 @@ class DataLoader(Generic[_T_co]):
     def _get_stateful_iterator(self) -> _BaseDataLoaderIter:
         """Create a stateful iterator that supports state_dict/load_state_dict."""
         if self.num_workers == 0:
-            return _StatefulSingleProcessDataLoaderIter(self, self.next_iter_state)
+            iterator = _StatefulSingleProcessDataLoaderIter(self, self.next_iter_state)
         else:
             self.check_worker_number_rationality()
-            return _StatefulMultiProcessingDataLoaderIter(self, self.next_iter_state)
+            iterator = _StatefulMultiProcessingDataLoaderIter(
+                self, self.next_iter_state
+            )
+
+        # Important: Clear the next_iter_state after passing it to the iterator
+        # This matches the behavior of the original StatefulDataLoader
+        self.next_iter_state = None
+        return iterator
 
     @property
     def multiprocessing_context(self):
