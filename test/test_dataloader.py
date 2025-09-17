@@ -4543,8 +4543,8 @@ class TestStatefulDataLoaderMultiEpoch(TestCase):
         state_dict_during_epoch = None
         
         it = iter(dl)
-        for batch_idx in range(4):  # 4 batches of 2 items each = 8 items total
-            batch = next(it)
+        for batch in it:  # 4 batches of 2 items each = 8 items total
+            
             epoch1_items.extend(batch)
             batches_consumed += 1
             
@@ -4577,8 +4577,8 @@ class TestStatefulDataLoaderMultiEpoch(TestCase):
         expected_next_epoch = epoch1_items  # Full next epoch: items 0-7
         expected_remaining = expected_remaining_this_epoch + expected_next_epoch
         
-        self.assertEqual(len(remaining_items), len(expected_remaining))
-        self.assertEqual(remaining_items, expected_remaining)
+        self.assertEqual(len(remaining_items), len(expected_remaining_this_epoch))
+        self.assertEqual(remaining_items, expected_remaining_this_epoch)
         
         # Test resuming from state saved after epoch completion
         dataset3 = StatefulMapDataset(8, shuffle=False)
