@@ -54,11 +54,12 @@ class _AckStartup:
 
 
 # State constants for stateful workers
-_DATASET_ITER_STATE = "_dataset_iter_state"
-_DATASET_STATE = "_dataset_state"
-_FETCHER_ENDED = "_fetcher_ended"
-_FETCHER_STATE = "_fetcher_state"
-_WORKER_ID = "_worker_id"
+
+_WORKER_ID = "worker_id"
+_FETCHER_STATE = "fetcher_state"
+_FETCHER_ENDED = "fetcher_ended"
+_DATASET_STATE = "dataset_state"
+_DATASET_ITER_STATE = "dataset_iter_state"
 
 
 class _IncrementalWorkerState:
