@@ -1846,10 +1846,10 @@ class _StatefulSingleProcessDataLoaderIter(_StatefulBaseDataLoaderIter):
         """Return the state dictionary for checkpointing."""
         if self._dataset_kind == _DatasetKind.Iterable:
             fetcher_state = {
-                "dataset_iter_state": try_to_serialize(
+                _DATASET_ITER_STATE: try_to_serialize(
                     self._dataset_fetcher.dataset_iter
                 ),
-                "fetcher_ended": self._dataset_fetcher.ended,
+                _FETCHER_STATE: self._dataset_fetcher.ended,
             }
             dataset_state = None
             if self._dataset_fetcher.dataset_iter is not self._dataset_fetcher.dataset:
@@ -1906,11 +1906,11 @@ class _StatefulSingleProcessDataLoaderIter(_StatefulBaseDataLoaderIter):
         #  1. try to restore dataset state
         #  2. generate dataset iterator
         #  3. try to restore iterator state
-        if state_dict["dataset_state"] is not None and isinstance(
+        if state_dict[_DATASET_STATE] is not None and isinstance(
             self._dataset, Stateful
         ):
             self._dataset = _try_to_deserialize(
-                self._dataset, state_dict["dataset_state"]
+                self._dataset, state_dict[_DATASET_STATE]
             )
 
         self._dataset_fetcher = _DatasetKind.create_fetcher(
@@ -1926,14 +1926,14 @@ class _StatefulSingleProcessDataLoaderIter(_StatefulBaseDataLoaderIter):
             if isinstance(self._dataset, Stateful) or isinstance(
                 self._dataset_fetcher.dataset_iter, Stateful
             ):
-                if state_dict["fetcher_state"] is not None:
-                    if state_dict["fetcher_state"]["dataset_iter_state"] is not None:
+                if state_dict[_FETCHER_STATE] is not None:
+                    if state_dict[_FETCHER_STATE][_DATASET_ITER_STATE] is not None:
                         self._dataset_fetcher.dataset_iter = _try_to_deserialize(
                             self._dataset_fetcher.dataset_iter,
-                            state_dict["fetcher_state"]["dataset_iter_state"],
+                            state_dict[_FETCHER_STATE][_DATASET_ITER_STATE],
                         )
-                    self._dataset_fetcher.ended = state_dict["fetcher_state"][
-                        "fetcher_ended"
+                    self._dataset_fetcher.ended = state_dict[_FETCHER_STATE][
+                        _FETCHER_STATE
                     ]
             else:
                 # No state, just try to fastforward
