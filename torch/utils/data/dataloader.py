@@ -38,7 +38,6 @@ from torch.utils.data.sampler import (
     SequentialSampler,
     StatefulBatchSampler,
 )
-from typing_extensions import Self
 
 from ._utils.stateful import Stateful
 from ._utils.worker import get_worker_info, try_to_serialize
@@ -1893,9 +1892,9 @@ class _StatefulSingleProcessDataLoaderIter(_StatefulBaseDataLoaderIter):
 
     def load_state_dict(self, state_dict):
         """Load state from a checkpoint."""
-        assert (
-            self._NUM_YIELDED in state_dict
-        ), f"State doesn't contain key '{self._NUM_YIELDED}' expected for single process dataloader"
+        assert self._NUM_YIELDED in state_dict, (
+            f"State doesn't contain key '{self._NUM_YIELDED}' expected for single process dataloader"
+        )
 
         self._sampler_iter_yielded = state_dict[_SAMPLER_ITER_YIELDED]
 
@@ -2032,9 +2031,9 @@ class _StatefulMultiProcessingDataLoaderIter(
 
         worker_states = {self._worker_key(i): None for i in range(self._num_workers)}
         if next_iter_state is not None:
-            assert (
-                self._SNAPSHOT in next_iter_state
-            ), f"State doesn't contain key '{self._SNAPSHOT}' expected for multiprocess dataloader"
+            assert self._SNAPSHOT in next_iter_state, (
+                f"State doesn't contain key '{self._SNAPSHOT}' expected for multiprocess dataloader"
+            )
             wstates = next_iter_state[self._SNAPSHOT].get(self._WORKER_SNAPSHOTS, {})
             assert set(map(self._worker_key, range(len(wstates)))) == set(
                 wstates.keys()
@@ -2164,9 +2163,8 @@ class _StatefulMultiProcessingDataLoaderIter(
                     self._try_put_index()
                 if self._num_yielded > 0:
                     logger.warning(
-                        f"Neither dataset nor iter(dataset) defines state_dict/load_state_dict so we are "
-                        f"naively fast-forwarding your dataset by {self._num_yielded} steps. For more efficient "
-                        f"resumes, please implement `state_dict` and `load_state_dict` in your IterableDataset and/or iterator."
+                        "Neither dataset nor iter(dataset) defines state_dict/load_state_dict so we are naively fast-forwarding your dataset by %d steps. For more efficient resumes, please implement `state_dict` and `load_state_dict` in your IterableDataset and/or iterator.",
+                        self._num_yielded,
                     )
                     for _ in range(self._num_yielded):
                         next(self)
@@ -2324,28 +2322,16 @@ class _StatefulMultiProcessingDataLoaderIter(
                         assert data.initial_state is not None
                         self._worker_snapshots[
                             self._worker_key(data.worker_id)
-<<<<<<< HEAD
-                        ].apply_delta(
-                            data.initial_state
-                        )  # type: ignore[arg-type]
-=======
                         ].apply_delta(cast(dict[str, Any], data.initial_state))
->>>>>>> a2754acc25 (solve lint issues)
+
                     else:
                         assert data.initial_state is not None
                         from ._utils.worker import _IncrementalWorkerState
 
-<<<<<<< HEAD
-                        self._worker_snapshots[
-                            self._worker_key(data.worker_id)
-                        ] = _IncrementalWorkerState(
-                            data.initial_state  # type: ignore[arg-type]
-=======
                         self._worker_snapshots[self._worker_key(data.worker_id)] = (
                             _IncrementalWorkerState(
                                 cast(dict[str, Any], data.initial_state)
                             )
->>>>>>> a2754acc25 (solve lint issues)
                         )
                     remaining -= 1
                 else:
@@ -2374,10 +2360,10 @@ class _StatefulMultiProcessingDataLoaderIter(
                     assert data.initial_state is not None, data
                     from ._utils.worker import _IncrementalWorkerState
 
-                    self._worker_snapshots[
-                        self._worker_key(data.worker_id)
-                    ] = _IncrementalWorkerState(
-                        data.initial_state  # type: ignore[arg-type]
+                    self._worker_snapshots[self._worker_key(data.worker_id)] = (
+                        _IncrementalWorkerState(
+                            data.initial_state  # type: ignore[arg-type]
+                        )
                     )
                     resume_iteration_cnt -= 1
 
@@ -2449,9 +2435,9 @@ class _StatefulMultiProcessingDataLoaderIter(
                         self._workers_status[data.worker_id] = False
                     else:
                         self._mark_worker_as_unavailable(data.worker_id)
-                    assert (
-                        state_dict is not None
-                    ), "StopIteration should always be accompanied by a state_dict"
+                    assert state_dict is not None, (
+                        "StopIteration should always be accompanied by a state_dict"
+                    )
                     self._try_put_index()
                     # We want to process states until we get to that position
                     # in the worker cycle, therefore if out-of-order we want

@@ -9,7 +9,7 @@ import os
 import queue
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, TYPE_CHECKING, TypeVar, Union
+from typing import Any, Optional, TYPE_CHECKING, TypeVar, Union
 
 import torch
 from torch._utils import ExceptionWrapper
@@ -25,14 +25,14 @@ T = TypeVar("T")
 
 
 # Stateful functionality
-def try_to_serialize(obj: Any) -> Union[dict, None]:
+def try_to_serialize(obj: Any) -> Optional[dict[str, Any]]:
     """Try to serialize an object if it implements Stateful protocol."""
     if isinstance(obj, Stateful):
         return obj.state_dict()
     return None
 
 
-def try_to_deserialize(obj: T, state_dict: dict) -> T:
+def try_to_deserialize(obj: T, state_dict: dict[str, Any]) -> T:
     """Try to deserialize an object if it implements Stateful protocol."""
     if isinstance(obj, Stateful) and state_dict is not None:
         obj.load_state_dict(state_dict)
@@ -48,7 +48,7 @@ class _AckStartup:
     """Dummy class used to ack startup and return state at time 0"""
 
     worker_id: int
-    initial_state: Optional[Union[Dict[str, Any], ExceptionWrapper]]
+    initial_state: Optional[Union[dict[str, Any], ExceptionWrapper]]
     is_delta: bool = False
 
 
@@ -64,7 +64,7 @@ _DATASET_ITER_STATE = "dataset_iter_state"
 class _IncrementalWorkerState:
     """Manages incremental state changes for worker processes."""
 
-    def __init__(self, initial_worker_state_dict: Optional[Dict[str, Any]]):
+    def __init__(self, initial_worker_state_dict: Optional[dict[str, Any]]):
         self._worker_id = None
         self._fetcher_ended = None
 
@@ -82,7 +82,7 @@ class _IncrementalWorkerState:
         self._dataset_state = dataset_state
         self._fetcher_iter_state = fetcher_iter_state
 
-    def generate_delta(self, new_state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def generate_delta(self, new_state_dict: dict[str, Any]) -> dict[str, Any]:
         assert _WORKER_ID in new_state_dict
         self._worker_id = new_state_dict[_WORKER_ID]
 
@@ -109,7 +109,7 @@ class _IncrementalWorkerState:
             }
         return incr_state_dict
 
-    def apply_delta(self, delta_state_dict: Dict[str, Any]) -> None:
+    def apply_delta(self, delta_state_dict: dict[str, Any]) -> None:
         """Apply a delta to the current state."""
         self._worker_id = delta_state_dict[_WORKER_ID]
         ds_state = delta_state_dict.get(_DATASET_STATE, None)
@@ -123,7 +123,7 @@ class _IncrementalWorkerState:
             if iter_state is not None:
                 self._fetcher_iter_state = iter_state
 
-    def get_state(self) -> Dict[str, Any]:
+    def get_state(self) -> dict[str, Any]:
         """Get the current state."""
         fetcher_state = (
             {
@@ -654,7 +654,7 @@ def _worker_loop(
         data_queue.close()
 
 
-def _make_state_dict(worker_id, dataset_kind, fetcher, dataset) -> Dict[str, Any]:
+def _make_state_dict(worker_id, dataset_kind, fetcher, dataset) -> dict[str, Any]:
     """Create a state dictionary for the current worker state."""
     from torch.utils.data import _DatasetKind
 
