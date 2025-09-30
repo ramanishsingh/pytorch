@@ -16,8 +16,7 @@ import os
 import queue
 import threading
 import warnings
-from collections.abc import Callable
-from typing import Any, Generic, Optional, TYPE_CHECKING, TypeVar, Union
+from typing import Any, Callable, Dict, Generic, Optional, TYPE_CHECKING, TypeVar, Union
 
 import torch
 import torch.distributed as dist
@@ -41,7 +40,8 @@ from torch.utils.data.sampler import (
 from typing_extensions import Self
 
 from ._utils.stateful import Stateful
-from ._utils.worker import get_worker_info, try_to_deserialize, try_to_serialize
+from ._utils.worker import get_worker_info, try_to_serialize
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -434,7 +434,6 @@ class DataLoader(Generic[_T_co]):
         if batch_size is not None and batch_sampler is None:
             # auto_collation without custom batch_sampler
             if self.stateful:
-
                 batch_sampler = StatefulBatchSampler(sampler, batch_size, drop_last)
             else:
                 batch_sampler = BatchSampler(sampler, batch_size, drop_last)
@@ -2094,7 +2093,9 @@ class _StatefulMultiProcessingDataLoaderIter(
                 )
 
         # .pid can be None only before process is spawned (not the case, so ignore)
-        _utils.signal_handling._set_worker_pids(id(self), tuple(w.pid for w in self._workers))  # type: ignore[misc]
+        _utils.signal_handling._set_worker_pids(
+            id(self), tuple(w.pid for w in self._workers)
+        )  # type: ignore[misc]
         _utils.signal_handling._set_SIGCHLD_handler()
         self._worker_pids_set = True
 
@@ -2299,7 +2300,11 @@ class _StatefulMultiProcessingDataLoaderIter(
                         data.initial_state.reraise()
 
                     if data.is_delta:
-                        self._worker_snapshots[self._worker_key(data.worker_id)].apply_delta(data.initial_state)  # type: ignore[arg-type]
+                        self._worker_snapshots[
+                            self._worker_key(data.worker_id)
+                        ].apply_delta(
+                            data.initial_state
+                        )  # type: ignore[arg-type]
                     else:
                         from ._utils.worker import _IncrementalWorkerState
 
