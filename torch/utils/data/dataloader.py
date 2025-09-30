@@ -16,7 +16,8 @@ import os
 import queue
 import threading
 import warnings
-from typing import Any, Callable, Dict, Generic, Optional, TYPE_CHECKING, TypeVar, Union
+from typing import Any, Callable, cast, Generic, Optional, TYPE_CHECKING, TypeVar, Union
+from typing_extensions import Self
 
 import torch
 import torch.distributed as dist
@@ -72,7 +73,6 @@ _collate_fn_t = Callable[[list[_T]], Any]
 default_collate: _collate_fn_t = _utils.collate.default_collate
 default_convert = _utils.collate.default_convert
 
-get_worker_info = _utils.worker.get_worker_info
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +329,7 @@ class DataLoader(Generic[_T_co]):
         # Stateful functionality
         self.stateful = stateful
         self.snapshot_every_n_steps = snapshot_every_n_steps
-        self.next_iter_state: Optional[Dict[str, Any]] = None
+        self.next_iter_state: Optional[dict[str, Any]] = None
         # When a state_dict is requested before __iter__ is called,
         # we create the __iter__ so we can get a copy of the initial state from
         # its workers. In those cases, we can avoid creating a new multiprocessing
@@ -474,10 +474,17 @@ class DataLoader(Generic[_T_co]):
             self.check_worker_number_rationality()
             return _MultiProcessingDataLoaderIter(self)
 
-    def _get_stateful_iterator(self) -> _BaseDataLoaderIter:
+    def _get_stateful_iterator(
+        self,
+    ) -> Union[
+        _StatefulSingleProcessDataLoaderIter, _StatefulMultiProcessingDataLoaderIter
+    ]:
         """Create a stateful iterator that supports state_dict/load_state_dict."""
         if self.num_workers == 0:
-            iterator = _StatefulSingleProcessDataLoaderIter(self, self.next_iter_state)
+            iterator: Union[
+                _StatefulSingleProcessDataLoaderIter,
+                _StatefulMultiProcessingDataLoaderIter,
+            ] = _StatefulSingleProcessDataLoaderIter(self, self.next_iter_state)
         else:
             self.check_worker_number_rationality()
             iterator = _StatefulMultiProcessingDataLoaderIter(
@@ -570,7 +577,7 @@ class DataLoader(Generic[_T_co]):
 
         return self._iterator
 
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self) -> dict[str, Any]:
         """
         Return the state of the dataloader for checkpointing purposes.
 
@@ -595,7 +602,7 @@ class DataLoader(Generic[_T_co]):
                 "This should not happen with stateful=True."
             )
 
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """
         Load the state of the dataloader from a checkpoint.
 
@@ -917,6 +924,20 @@ class _SingleProcessDataLoaderIter(_BaseDataLoaderIter):
 
 class _MultiProcessingDataLoaderIterBase(_BaseDataLoaderIter):
     """Base class for multiprocessing dataloader iterators with shared data fetching logic."""
+
+    # Attributes that are initialized in subclasses (_MultiProcessingDataLoaderIter and
+    # _StatefulMultiProcessingDataLoaderIter) but referenced in this base class.
+    _data_queue: Any
+    _workers: list[Any]
+    _workers_status: list[bool]
+    _mark_worker_as_unavailable: Callable[..., None]
+    _pin_memory_thread: threading.Thread
+    _pin_memory_thread_done_event: threading.Event
+    _worker_result_queue: Any
+    _workers_done_event: Any
+    _index_queues: list[Any]
+    _worker_pids_set: bool
+    _shutdown: bool
 
     def _try_get_data(self, timeout=_utils.MP_STATUS_CHECK_INTERVAL):
         # Tries to fetch data from `self._data_queue` once for a given timeout.
@@ -1938,9 +1959,10 @@ class _StatefulSingleProcessDataLoaderIter(_StatefulBaseDataLoaderIter):
                 # No state, just try to fastforward
                 if self._num_yielded > 0:
                     logger.warning(
-                        f"Neither dataset nor iter(dataset) defines state_dict/load_state_dict so we are "
-                        f"naively fast-forwarding your dataset by {self._num_yielded} steps. For more efficient "
-                        f"resumes, please implement `state_dict` and `load_state_dict` in your IterableDataset and/or iterator."
+                        "Neither dataset nor iter(dataset) defines state_dict/load_state_dict so we are "
+                        "naively fast-forwarding your dataset by %d steps. For more efficient "
+                        "resumes, please implement `state_dict` and `load_state_dict` in your IterableDataset and/or iterator.",
+                        self._num_yielded,
                     )
                     for _ in range(self._num_yielded):
                         next(self)
@@ -2020,8 +2042,7 @@ class _StatefulMultiProcessingDataLoaderIter(
                 len(wstates),
                 wstates.keys(),
             )
-            for worker_key, sd in wstates.items():
-                worker_states[worker_key] = sd
+            worker_states.update(wstates)
             self._base_seed = next_iter_state[self._SNAPSHOT][self._MAIN_SNAPSHOT].get(
                 self._BASE_SEED, self._base_seed
             )
@@ -2193,8 +2214,8 @@ class _StatefulMultiProcessingDataLoaderIter(
         snapshot_step: int,
         last_yielded_worker_id: int,
         num_workers: int,
-        main_snapshot: Dict[str, Any],
-        worker_snapshots: Dict[str, Any],
+        main_snapshot: dict[str, Any],
+        worker_snapshots: dict[str, Any],
     ):
         self._snapshot = {
             self._SNAPSHOT_STEP: snapshot_step,
@@ -2300,18 +2321,31 @@ class _StatefulMultiProcessingDataLoaderIter(
                         data.initial_state.reraise()
 
                     if data.is_delta:
+                        assert data.initial_state is not None
                         self._worker_snapshots[
                             self._worker_key(data.worker_id)
+<<<<<<< HEAD
                         ].apply_delta(
                             data.initial_state
                         )  # type: ignore[arg-type]
+=======
+                        ].apply_delta(cast(dict[str, Any], data.initial_state))
+>>>>>>> a2754acc25 (solve lint issues)
                     else:
+                        assert data.initial_state is not None
                         from ._utils.worker import _IncrementalWorkerState
 
+<<<<<<< HEAD
                         self._worker_snapshots[
                             self._worker_key(data.worker_id)
                         ] = _IncrementalWorkerState(
                             data.initial_state  # type: ignore[arg-type]
+=======
+                        self._worker_snapshots[self._worker_key(data.worker_id)] = (
+                            _IncrementalWorkerState(
+                                cast(dict[str, Any], data.initial_state)
+                            )
+>>>>>>> a2754acc25 (solve lint issues)
                         )
                     remaining -= 1
                 else:
@@ -2524,14 +2558,14 @@ class _StatefulMultiProcessingDataLoaderIter(
         self._worker_snapshots[worker_key].apply_delta(state_dict)
 
     def _take_snapshot(self):
-        main_snapshot_idx = None
+        main_snapshot_idx: Optional[int] = None
+        main_snapshot: Optional[dict[str, Any]] = None
         while len(self._main_snapshots) and (
             self._main_snapshots[0][0] <= self._rcvd_idx - 1
         ):
             main_snapshot_idx, main_snapshot = self._main_snapshots.popleft()
-        if not self._in_order and main_snapshot_idx is None:
-            # in_order is False and no main snapshot is available as we're ahead of rcvd_idx
-            # we can't take a snapshot with the current implementation
+        if (not self._in_order and main_snapshot_idx is None) or main_snapshot is None:
+            # No main snapshot available to take at this point
             return
         assert main_snapshot_idx == self._rcvd_idx - 1, (
             main_snapshot_idx,

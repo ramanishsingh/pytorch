@@ -15,7 +15,6 @@ import torch
 from torch._utils import ExceptionWrapper
 
 from . import HAS_NUMPY, IS_WINDOWS, MP_STATUS_CHECK_INTERVAL, signal_handling
-
 from .stateful import Stateful
 
 
@@ -579,6 +578,7 @@ def _worker_loop(
                 continue
 
             # Parse message format based on stateful mode
+            snapshot = False  # Initialize snapshot to avoid undefined variable
             if is_stateful:
                 idx, (index, snapshot) = r
             else:
@@ -593,7 +593,9 @@ def _worker_loop(
             else:
                 try:
                     try:
-                        data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+                        if fetcher is None:
+                            raise RuntimeError("Fetcher is not initialized")
+                        data = fetcher.fetch(index)
                     except StopIteration:
                         if not dataset_kind == _DatasetKind.Iterable:
                             raise
@@ -604,15 +606,19 @@ def _worker_loop(
                         iteration_end = True
 
                     # Generate state delta for stateful workers when needed
-                    if is_stateful and (snapshot or iteration_end):
-                        # Generate incremental diff from prev_state_dict and current_state_dict
-                        state_dict = _make_state_dict(
-                            worker_id, dataset_kind, fetcher, dataset
-                        )
-                        delta_state_dict = incremental_worker_state.generate_delta(
-                            state_dict
-                        )
-                        del state_dict
+                    if is_stateful:
+                        snapshot_needed = snapshot or iteration_end
+
+                        if snapshot_needed:
+                            # Generate incremental diff from prev_state_dict and current_state_dict
+                            state_dict = _make_state_dict(
+                                worker_id, dataset_kind, fetcher, dataset
+                            )
+                            if incremental_worker_state is not None:
+                                delta_state_dict = (
+                                    incremental_worker_state.generate_delta(state_dict)
+                                )
+                            del state_dict
                 except Exception as e:
                     if (
                         not is_stateful
